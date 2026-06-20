@@ -1,4 +1,4 @@
-# fluid
+# ripple
 
 A real-time 2D fluid playground in Rust — several fluid models in **one window**,
 switchable live, built on **winit + wgpu** with an **egui** tuning panel.
@@ -14,6 +14,9 @@ Backends (press the number keys to switch):
 5. **GPU smoke** — the Eulerian solver running entirely in wgpu compute shaders
    (semi-Lagrangian advection + a ping-pong Jacobi pressure projection),
    rendered straight from the density buffer.
+6. **GPU FLIP** — the FLIP/PIC water solver on the GPU: particle↔grid transfer
+   (P2G via fixed-point integer atomics), the same Jacobi projection on a MAC
+   grid with a free surface, all state resident in buffers.
 
 Each backend implements a `Simulation` trait, so the app just drives whichever is
 active; rendering goes through a small shared wgpu toolkit (particle dots, a field
@@ -32,7 +35,7 @@ Vulkan / DX12).
 
 | Key | Action |
 |-----|--------|
-| 1–5 | Switch backend: CPU SPH / smoke / FLIP / GPU SPH / GPU smoke |
+| 1–6 | Switch backend: CPU SPH / smoke / FLIP / GPU SPH / GPU smoke / GPU FLIP |
 | ← / → | Shake the fluid sideways (liquids) |
 | Space | Shake the fluid upward (liquids) |
 | ↑ / ↓ | Gravity strength (liquids) |
@@ -65,6 +68,9 @@ The wgpu app and its building blocks live in `src/gpu/`:
 - `smoke_gpu.rs` (`GpuSmoke` + backend) — the GPU Eulerian smoke solver
   (`smoke.wgsl`) with a ping-pong Jacobi pressure projection (the reusable grid
   primitive), drawn by `smoke_render.wgsl`.
+- `flip_gpu.rs` (`GpuFlip` + backend) — the GPU FLIP water solver (`flip.wgsl`):
+  fixed-point-atomic P2G, the same Jacobi projection on a MAC grid with a free
+  surface, drawn by `flip_render.wgsl`.
 - `particles.rs` / `field.rs` — generic particle-dots and field-texture renderers
   for the CPU backends; `render.rs` (+ `render.wgsl`, `metaball_*.wgsl`,
   `marching_squares*.wgsl`) — the GPU-SPH renderer (dots / metaballs / MS).
@@ -108,8 +114,8 @@ runs the compute shaders and reads positions back, matching the CPU's settling.
 
 ## Possible next steps
 
-- GPU FLIP — reuse the Jacobi grid projection (already built for GPU smoke); the
-  remaining piece is particle↔grid transfer (P2G needs float atomics or a sort).
+- Profile GPU FLIP (`gpu_profile`-style timestamps) and tune the Jacobi
+  iteration count / substeps; try particle reordering for P2G locality.
 - A parallel-scan primitive (for a sorted GPU neighbour grid / FLIP compaction).
 - Surface tension / two fluids; resizable GPU simulation domain.
 - Per-pass timing surfaced live in the egui panel.

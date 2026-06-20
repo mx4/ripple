@@ -1,4 +1,4 @@
-//! Fluid — one winit + wgpu window hosting every fluid backend behind the
+//! Ripple — one winit + wgpu window hosting every fluid backend behind the
 //! `Simulation` trait, switchable live with the number keys:
 //!   1 CPU SPH liquid   2 Eulerian smoke   3 FLIP water   4 GPU SPH
 //! An egui panel shows live stats and per-backend tuning. The app owns the
@@ -7,9 +7,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use fluid::gpu::{
-    EguiOverlay, FlipBackend, Gpu, GpuSmokeBackend, Input, Simulation, SmokeBackend, SphBackend,
-    SphCpuBackend,
+use ripple::gpu::{
+    EguiOverlay, FlipBackend, Gpu, GpuFlipBackend, GpuSmokeBackend, Input, Simulation, SmokeBackend,
+    SphBackend, SphCpuBackend,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -39,7 +39,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("Fluid — 1 CPU SPH  2 smoke  3 FLIP  4 GPU SPH  5 GPU smoke")
+            .with_title("Ripple — 1 CPU SPH  2 smoke  3 FLIP  4 GPU SPH  5 GPU smoke  6 GPU FLIP")
             .with_inner_size(LogicalSize::new(900.0, 700.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let gpu = Gpu::new(window.clone());
@@ -87,6 +87,7 @@ impl ApplicationHandler for App {
                         KeyCode::Digit3 => st.sim = Box::new(FlipBackend::new(&st.gpu)),
                         KeyCode::Digit4 => st.sim = Box::new(SphBackend::new(&st.gpu)),
                         KeyCode::Digit5 => st.sim = Box::new(GpuSmokeBackend::new(&st.gpu)),
+                        KeyCode::Digit6 => st.sim = Box::new(GpuFlipBackend::new(&st.gpu)),
                         _ => {}
                     }
                 }
@@ -127,11 +128,11 @@ impl ApplicationHandler for App {
                         ..
                     } = st;
                     overlay.draw(gpu, window, &view, |ctx| {
-                        egui::Window::new("Fluid")
+                        egui::Window::new("Ripple")
                             .default_pos((10.0, 10.0))
                             .show(ctx, |ui| {
                                 ui.label(format!("{name}    {fps:.0} fps"));
-                                ui.label("[1] CPU SPH  [2] smoke  [3] FLIP  [4] GPU SPH  [5] GPU smoke");
+                                ui.label("[1] CPU SPH  [2] smoke  [3] FLIP  [4] GPU SPH  [5] GPU smoke  [6] GPU FLIP");
                                 ui.separator();
                                 sim.ui(gpu, ui);
                             });
