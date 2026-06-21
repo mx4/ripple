@@ -40,14 +40,28 @@ struct Params {
     _pad0: f32,
 }
 
+// Position/velocity are double-buffered: the read-only `pos`/`vel` are the
+// current state; the fused forces+integrate pass writes the next state into
+// `pos_out`/`vel_out`. The host swaps the two sets each step (ping-pong bind
+// groups). This is what lets us fuse the force gather and the integrator into a
+// single dispatch without a write-after-read race on the shared positions.
 @group(0) @binding(0) var<uniform> P: Params;
-@group(0) @binding(1) var<storage, read_write> pos: array<vec2<f32>>;
-@group(0) @binding(2) var<storage, read_write> vel: array<vec2<f32>>;
-@group(0) @binding(3) var<storage, read_write> force: array<vec2<f32>>;
-@group(0) @binding(4) var<storage, read_write> rho: array<f32>;
-@group(0) @binding(5) var<storage, read_write> pressure: array<f32>;
+@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> vel: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read_write> pos_out: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read_write> vel_out: array<vec2<f32>>;
+@group(0) @binding(5) var<storage, read_write> rho: array<f32>;
 @group(0) @binding(6) var<storage, read_write> grid_count: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> grid_cells: array<u32>;
+
+// Pressure is a cheap closed form of density (Müller WCSPH, clamped >= 0 so the
+// fluid never pulls). We recompute it inline wherever needed instead of storing
+// a whole per-particle buffer — the `forces` pass already loads each neighbour's
+// rho, so deriving its pressure is a couple of ALU ops vs. an extra random
+// gather in the kernel that dominates the step.
+fn pressure_of(density: f32) -> f32 {
+    return max(P.stiffness * (density - P.rest_dens), 0.0);
+}
 
 fn cell_xy(p: vec2<f32>) -> vec2<i32> {
     let cx = i32(clamp(floor(p.x / P.h), 0.0, f32(P.cols) - 1.0));
@@ -98,16 +112,22 @@ fn density_pressure(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     rho[i] = r;
-    // Clamp pressure >= 0 (no tensile/attractive forces).
-    pressure[i] = max(P.stiffness * (r - P.rest_dens), 0.0);
 }
 
+// Fused force gather + integration. Computing the SPH force leaves it in a
+// register and steps the particle immediately, so there is no separate
+// `force` buffer and one fewer dispatch/barrier per step. Reads come from the
+// current `pos`/`vel`; the new state is written to `pos_out`/`vel_out` (the
+// host ping-pongs the two), which is why the in-place write-after-read race the
+// split passes avoided can't happen here.
 @compute @workgroup_size(64)
-fn forces(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn forces_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= P.num) { return; }
     let pi = pos[i];
     let vi = vel[i];
+    let rho_i = max(rho[i], 1e-6);
+    let press_i = pressure_of(rho[i]);
     let c = cell_xy(pi);
     var fpress = vec2<f32>(0.0, 0.0);
     var fvisc = vec2<f32>(0.0, 0.0);
@@ -122,32 +142,29 @@ fn forces(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let rlen = length(rij);
                 if (rlen < P.h && rlen > 0.0) {
                     let dir = rij / rlen;
-                    let rho_j = max(rho[j], 1e-6);
+                    let rho_j_raw = rho[j];
+                    let rho_j = max(rho_j_raw, 1e-6);
+                    let press_j = pressure_of(rho_j_raw);
                     let hr = P.h - rlen;
                     // Pressure repels (-dir); viscosity diffuses velocity.
-                    fpress -= dir * P.mass * (pressure[i] + pressure[j]) / (2.0 * rho_j)
+                    fpress -= dir * P.mass * (press_i + press_j) / (2.0 * rho_j)
                         * P.spiky_grad * hr * hr;
                     fvisc += P.visc * P.mass * (vel[j] - vi) / rho_j * P.visc_lap * hr;
                 }
             }
         }
     }
-    force[i] = fpress + fvisc;
-}
 
-@compute @workgroup_size(64)
-fn integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= P.num) { return; }
-    let r = max(rho[i], 1e-6);
+    // --- integrate (was the separate `integrate` pass) ---
+    let force = fpress + fvisc;
     let grav = vec2<f32>(P.gravity_x, P.gravity_y);
-    var v = vel[i] + P.dt * (force[i] / r + grav);
+    var v = vi + P.dt * (force / rho_i + grav);
     v += vec2<f32>(P.impulse_x, P.impulse_y); // one-shot shake (already /substeps)
     let speed = length(v);
     if (speed > P.max_speed) {
         v *= P.max_speed / speed;
     }
-    var p = pos[i] + P.dt * v;
+    var p = pi + P.dt * v;
 
     let pad = P.particle_radius;
     if (P.bound_shape == 0u) {
@@ -167,6 +184,6 @@ fn integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (vn > 0.0) { v -= (1.0 + P.bound_damping) * vn * n; }
         }
     }
-    vel[i] = v;
-    pos[i] = p;
+    vel_out[i] = v;
+    pos_out[i] = p;
 }

@@ -91,6 +91,9 @@ impl Simulation for SphBackend {
             for _ in 0..steps {
                 self.sim.record_step(&mut enc);
             }
+            // Reconcile the ping-pong result back into the buffer the renderer
+            // binds (once per frame, not per substep).
+            self.sim.record_sync(&mut enc);
             gpu.queue.submit([enc.finish()]);
         }
     }

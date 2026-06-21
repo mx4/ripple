@@ -4,7 +4,12 @@
 
 use wgpu::util::DeviceExt;
 
-const GRID_CAP: u32 = 64; // max particles tracked per grid cell
+// Max particles tracked per grid cell. 32 right-sizes the grid buffer to real
+// occupancy (slightly faster than 64 and half the memory); 16 overflows dense
+// cells and regresses. `gpu_bench`.
+const GRID_CAP: u32 = 32;
+// Threads per workgroup. 64 is the sweet spot on Apple GPUs for these
+// register-heavy neighbour kernels; 128/256 reduce occupancy and regress.
 const WORKGROUP: u32 = 64;
 
 /// Uniform block shared by every compute pass. Field order/layout must match
@@ -58,29 +63,32 @@ pub struct GpuSim {
     initial_pos: Vec<[f32; 2]>,
 
     params_buf: wgpu::Buffer,
+    // Position/velocity are double-buffered for the fused forces+integrate pass.
+    // `pos_buf`/`vel_buf` are buffer A (also what the renderer binds); `*_b` are
+    // buffer B. `front` is the index (0=A, 1=B) currently holding the live state.
     pos_buf: wgpu::Buffer,
     vel_buf: wgpu::Buffer,
+    pos_buf_b: wgpu::Buffer,
+    vel_buf_b: wgpu::Buffer,
+    front: usize,
     // Persistent CPU-readback target (tests/debug only).
     readback_buf: wgpu::Buffer,
     // Touched only by the shaders (via the bind group); kept so the GPU buffers
     // stay alive for the sim's lifetime.
     #[allow(dead_code)]
-    force_buf: wgpu::Buffer,
-    #[allow(dead_code)]
     rho_buf: wgpu::Buffer,
-    #[allow(dead_code)]
-    pressure_buf: wgpu::Buffer,
     #[allow(dead_code)]
     grid_count_buf: wgpu::Buffer,
     #[allow(dead_code)]
     grid_cells_buf: wgpu::Buffer,
 
-    bind_group: wgpu::BindGroup,
+    // bind_groups[k] reads buffer k and writes buffer 1-k; used on the step whose
+    // `front` is k, then `front` flips.
+    bind_groups: [wgpu::BindGroup; 2],
     p_clear: wgpu::ComputePipeline,
     p_build: wgpu::ComputePipeline,
     p_density: wgpu::ComputePipeline,
-    p_forces: wgpu::ComputePipeline,
-    p_integrate: wgpu::ComputePipeline,
+    p_forces_integrate: wgpu::ComputePipeline,
 }
 
 impl GpuSim {
@@ -139,6 +147,11 @@ impl GpuSim {
         });
 
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        // Ping-pong buffers are both read (as `in`) and copied (B->A reconcile,
+        // readback), so they need COPY_SRC as well as COPY_DST.
+        let pingpong = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
         let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -149,15 +162,15 @@ impl GpuSim {
         };
         let vec2_bytes = (num as u64) * 8;
         let f32_bytes = (num as u64) * 4;
-        let vel_buf = mk("vel", vec2_bytes, storage);
+        let vel_buf = mk("vel", vec2_bytes, pingpong);
+        let pos_buf_b = mk("pos_b", vec2_bytes, pingpong);
+        let vel_buf_b = mk("vel_b", vec2_bytes, pingpong);
         let readback_buf = mk(
             "readback",
             vec2_bytes,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
-        let force_buf = mk("force", vec2_bytes, storage);
         let rho_buf = mk("rho", f32_bytes, storage);
-        let pressure_buf = mk("pressure", f32_bytes, storage);
         let grid_count_buf = mk("grid_count", (cells as u64) * 4, storage);
         let grid_cells_buf = mk("grid_cells", (cells as u64) * (GRID_CAP as u64) * 4, storage);
 
@@ -166,12 +179,14 @@ impl GpuSim {
             source: wgpu::ShaderSource::Wgsl(include_str!("sph.wgsl").into()),
         });
 
-        // One bind-group layout shared by all compute passes.
-        let storage_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        // One bind-group layout shared by all compute passes. Bindings 1/2 are
+        // the read-only `in` position/velocity; 3/4 the writable `out`; the rest
+        // are shared scratch.
+        let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                ty: wgpu::BufferBindingType::Storage { read_only },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
@@ -190,54 +205,38 @@ impl GpuSim {
                     },
                     count: None,
                 },
-                storage_entry(1),
-                storage_entry(2),
-                storage_entry(3),
-                storage_entry(4),
-                storage_entry(5),
-                storage_entry(6),
-                storage_entry(7),
+                storage_entry(1, true),  // pos_in
+                storage_entry(2, true),  // vel_in
+                storage_entry(3, false), // pos_out
+                storage_entry(4, false), // vel_out
+                storage_entry(5, false), // rho
+                storage_entry(6, false), // grid_count
+                storage_entry(7, false), // grid_cells
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sph-bg"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: pos_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: vel_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: force_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: rho_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: pressure_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: grid_count_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: grid_cells_buf.as_entire_binding(),
-                },
-            ],
-        });
+        // bind_groups[k]: reads buffer k (pos/vel in), writes buffer 1-k (out).
+        let make_bg = |label: &str, pos_in: &wgpu::Buffer, vel_in: &wgpu::Buffer,
+                       pos_out: &wgpu::Buffer, vel_out: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: pos_in.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: vel_in.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: pos_out.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: vel_out.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: rho_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: grid_count_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: grid_cells_buf.as_entire_binding() },
+                ],
+            })
+        };
+        let bind_groups = [
+            make_bg("sph-bg-a", &pos_buf, &vel_buf, &pos_buf_b, &vel_buf_b),
+            make_bg("sph-bg-b", &pos_buf_b, &vel_buf_b, &pos_buf, &vel_buf),
+        ];
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sph-pl"),
@@ -266,18 +265,18 @@ impl GpuSim {
             params_buf,
             pos_buf,
             vel_buf,
+            pos_buf_b,
+            vel_buf_b,
+            front: 0,
             readback_buf,
-            force_buf,
             rho_buf,
-            pressure_buf,
             grid_count_buf,
             grid_cells_buf,
-            bind_group,
+            bind_groups,
             p_clear: make("clear_grid"),
             p_build: make("build_grid"),
             p_density: make("density_pressure"),
-            p_forces: make("forces"),
-            p_integrate: make("integrate"),
+            p_forces_integrate: make("forces_integrate"),
         }
     }
 
@@ -321,21 +320,23 @@ impl GpuSim {
     }
 
     /// Number of compute passes per step (used to size timestamp query sets).
-    pub const PASSES: usize = 5;
+    /// clear → build grid → density → forces+integrate (the last two fused).
+    pub const PASSES: usize = 4;
 
     /// Record one full SPH timestep into `encoder`: clear → build grid →
-    /// density → forces → integrate. Each pass is separate so wgpu inserts the
-    /// memory barriers each stage depends on. If `qs` is given, begin/end GPU
-    /// timestamps are written per pass (slots 0..2*PASSES).
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, qs: Option<&wgpu::QuerySet>) {
+    /// density → fused forces+integrate. Each pass is separate so wgpu inserts
+    /// the memory barriers each stage depends on. The fused pass reads the
+    /// current (`front`) pos/vel and writes the other buffer, then `front`
+    /// flips. If `qs` is given, begin/end GPU timestamps are written per pass.
+    fn record(&mut self, encoder: &mut wgpu::CommandEncoder, qs: Option<&wgpu::QuerySet>) {
         let cells = self.cols * self.rows;
         let n = self.num;
+        let bg = &self.bind_groups[self.front];
         let passes = [
             (&self.p_clear, workgroups(cells)),
             (&self.p_build, workgroups(n)),
             (&self.p_density, workgroups(n)),
-            (&self.p_forces, workgroups(n)),
-            (&self.p_integrate, workgroups(n)),
+            (&self.p_forces_integrate, workgroups(n)),
         ];
         for (i, (pipe, groups)) in passes.into_iter().enumerate() {
             let timestamp_writes = qs.map(|q| wgpu::ComputePassTimestampWrites {
@@ -348,35 +349,51 @@ impl GpuSim {
                 timestamp_writes,
             });
             pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(groups, 1, 1);
         }
+        self.front ^= 1;
     }
 
-    pub fn record_step(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn record_step(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.record(encoder, None);
     }
 
     /// Like [`record_step`](Self::record_step) but writes per-pass GPU
     /// timestamps into `qs` (needs `2 * PASSES` slots). Profiling only —
     /// requires the `TIMESTAMP_QUERY` feature.
-    pub fn record_step_timed(&self, encoder: &mut wgpu::CommandEncoder, qs: &wgpu::QuerySet) {
+    pub fn record_step_timed(&mut self, encoder: &mut wgpu::CommandEncoder, qs: &wgpu::QuerySet) {
         self.record(encoder, Some(qs));
     }
 
-    /// Restore the initial particle block and zero velocities.
-    pub fn reset(&self, queue: &wgpu::Queue) {
+    /// After a frame's substeps, reconcile the live state back into buffer A
+    /// (which the renderer binds) so it draws the latest positions. Only the
+    /// renderer needs this; tests read the `front` buffer directly. One copy per
+    /// *frame*, never per substep, so the bandwidth is negligible.
+    pub fn record_sync(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.front == 1 {
+            let size = (self.num as u64) * 8;
+            encoder.copy_buffer_to_buffer(&self.pos_buf_b, 0, &self.pos_buf, 0, size);
+            encoder.copy_buffer_to_buffer(&self.vel_buf_b, 0, &self.vel_buf, 0, size);
+            self.front = 0;
+        }
+    }
+
+    /// Restore the initial particle block and zero velocities (into buffer A).
+    pub fn reset(&mut self, queue: &wgpu::Queue) {
         queue.write_buffer(&self.pos_buf, 0, bytemuck::cast_slice(&self.initial_pos));
         let zeros = vec![0u8; (self.num as usize) * 8];
         queue.write_buffer(&self.vel_buf, 0, &zeros);
+        self.front = 0;
     }
 
     /// Copy positions back to the CPU. For tests/debugging only — the render
-    /// path never does this. Uses the persistent `readback_buf`.
+    /// path never does this. Reads whichever buffer currently holds live state.
     pub fn read_positions(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<[f32; 2]> {
         let size = (self.num as u64) * 8;
+        let src = if self.front == 0 { &self.pos_buf } else { &self.pos_buf_b };
         let mut enc = device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&self.pos_buf, 0, &self.readback_buf, 0, size);
+        enc.copy_buffer_to_buffer(src, 0, &self.readback_buf, 0, size);
         queue.submit([enc.finish()]);
 
         let slice = self.readback_buf.slice(..);
@@ -479,7 +496,7 @@ mod tests {
             gpu.set_frame([0.0, 1200.0], 0.0008, [0.0, 0.0], 0);
             gpu.upload_params(&queue);
 
-            let run = |steps: usize| {
+            let mut run = |steps: usize| {
                 let mut done = 0;
                 while done < steps {
                     let chunk = 250.min(steps - done);
@@ -561,7 +578,7 @@ mod tests {
             warm += 200;
         }
 
-        let names = ["clear_grid", "build_grid", "density", "forces", "integrate"];
+        let names = ["clear_grid", "build_grid", "density", "forces+integrate"];
         let mut sums = [0.0f64; GpuSim::PASSES];
         let runs = 300;
         for _ in 0..runs {

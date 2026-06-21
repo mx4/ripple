@@ -1,8 +1,8 @@
 // GPU FLIP/PIC water. Particles carry the fluid; each step their velocities are
 // splatted onto a staggered MAC grid (P2G), the grid is made divergence-free by
-// a Jacobi pressure projection with a free surface (only fluid cells solved, air
-// p=0, no flow through solid walls), then read back to particles (G2P, PIC/FLIP
-// blend). Mirrors src/flip.rs.
+// a red-black SOR pressure projection with a free surface (only fluid cells
+// solved, air p=0, no flow through solid walls), then read back to particles
+// (G2P, PIC/FLIP blend). Mirrors src/flip.rs.
 //
 // P2G accumulation uses FIXED-POINT integer atomics (WGSL has no atomic<f32>):
 // values are scaled by SCALE and atomicAdd'd as i32; the scale cancels when the
@@ -165,15 +165,19 @@ fn divergence(@builtin(global_invocation_id) g: vec3<u32>) {
     div[c] = u[ui(i + 1u, j)] - u[ui(i, j)] + v[vi(i, j + 1u)] - v[vi(i, j)];
 }
 
-// One Jacobi sweep (the reusable grid primitive, free-surface variant).
-@compute @workgroup_size(8, 8)
-fn jacobi(@builtin(global_invocation_id) g: vec3<u32>) {
-    if (g.x >= P.nx || g.y >= P.ny) { return; }
-    let i = g.x;
-    let j = g.y;
+// Pressure projection by red-black Gauss-Seidel with over-relaxation (SOR).
+// Jacobi (the old kernel) converges very slowly: even 40 sweeps left the water
+// visibly compressible. Gauss-Seidel uses already-updated neighbours, and on a
+// 5-point stencil the grid splits into a checkerboard — every red cell's
+// neighbours are black and vice-versa, so a whole colour can be updated in place
+// with no race and no ping-pong buffer. Over-relaxation (OMEGA) accelerates
+// convergence further, so far fewer passes reach the same incompressibility.
+const OMEGA: f32 = 1.7;
+
+fn sor_cell(i: u32, j: u32) {
     let c = ci(i, j);
+    // Air/solid/boundary cells keep p = 0 (set in `divergence`); skip them.
     if (i == 0u || i == P.nx - 1u || j == 0u || j == P.ny - 1u || atomicLoad(&fluid[c]) == 0u) {
-        p2[c] = 0.0;
         return;
     }
     let sl = s[ci(i - 1u, j)];
@@ -182,11 +186,24 @@ fn jacobi(@builtin(global_invocation_id) g: vec3<u32>) {
     let su = s[ci(i, j + 1u)];
     let cnt = sl + sr + sd + su;
     if (cnt > 0.0) {
-        p2[c] = (sl * p[ci(i - 1u, j)] + sr * p[ci(i + 1u, j)]
+        let gs = (sl * p[ci(i - 1u, j)] + sr * p[ci(i + 1u, j)]
             + sd * p[ci(i, j - 1u)] + su * p[ci(i, j + 1u)] - div[c]) / cnt;
-    } else {
-        p2[c] = 0.0;
+        p[c] += OMEGA * (gs - p[c]);
     }
+}
+
+// Update the red cells ((i+j) even) — they read only black neighbours.
+@compute @workgroup_size(8, 8)
+fn sor_red(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= P.nx || g.y >= P.ny) { return; }
+    if (((g.x + g.y) & 1u) == 0u) { sor_cell(g.x, g.y); }
+}
+
+// Update the black cells ((i+j) odd) — they read the freshly-updated red cells.
+@compute @workgroup_size(8, 8)
+fn sor_black(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= P.nx || g.y >= P.ny) { return; }
+    if (((g.x + g.y) & 1u) == 1u) { sor_cell(g.x, g.y); }
 }
 
 @compute @workgroup_size(64)

@@ -1,13 +1,18 @@
 //! GPU FLIP/PIC water (`flip.wgsl`). All state — particles + the staggered MAC
 //! grid — lives in storage buffers; the whole step runs in compute. The pressure
-//! projection reuses the ping-pong Jacobi idea from GPU smoke (here on a MAC grid
-//! with a free surface). See `crate::flip` for the CPU reference.
+//! projection is a red-black Gauss-Seidel SOR solve on a MAC grid with a free
+//! surface (it converges far faster than the plain Jacobi sweep used by GPU
+//! smoke, so it reaches lower divergence in far fewer passes). See `crate::flip`
+//! for the CPU reference.
 
 use crate::gpu::{Gpu, Input, Simulation};
 use wgpu::util::DeviceExt;
 use winit::keyboard::KeyCode;
 
-const ITERS: usize = 40; // Jacobi iterations (even -> result ends in `p`)
+// Red-black SOR sweeps per step (each = 2 passes). 10 sweeps converges further
+// than the old 40 Jacobi iterations (less volume loss) at ~1.8x the throughput;
+// see `gpu_flip_bench`.
+const DEFAULT_SWEEPS: usize = 10;
 const NX: u32 = 128;
 const NY: u32 = 128;
 const H: f32 = 1.0;
@@ -40,6 +45,7 @@ pub struct GpuFlip {
     ny: u32,
     h: f32,
     num: u32,
+    sweeps: usize, // red-black SOR sweeps per step (each = 2 passes; dominant cost)
     initial_pos: Vec<[f32; 2]>,
 
     params_buf: wgpu::Buffer,
@@ -49,13 +55,13 @@ pub struct GpuFlip {
     keep: Vec<wgpu::Buffer>, // u,v,prev,accumulators,s,fluid,div kept alive
 
     bg_main: wgpu::BindGroup,
-    bg_swap: wgpu::BindGroup,
     p_integrate: wgpu::ComputePipeline,
     p_clear: wgpu::ComputePipeline,
     p_p2g: wgpu::ComputePipeline,
     p_normalize: wgpu::ComputePipeline,
     p_div: wgpu::ComputePipeline,
-    p_jacobi: wgpu::ComputePipeline,
+    p_sor_red: wgpu::ComputePipeline,
+    p_sor_black: wgpu::ComputePipeline,
     p_grad: wgpu::ComputePipeline,
     p_g2p: wgpu::ComputePipeline,
 }
@@ -214,8 +220,8 @@ impl GpuFlip {
                 entries: &e,
             })
         };
+        // SOR updates `p` in place, so one bind group suffices (no ping-pong).
         let bg_main = make_bg(&p, &p2);
-        let bg_swap = make_bg(&p2, &p);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("flip"),
@@ -243,19 +249,20 @@ impl GpuFlip {
             ny,
             h,
             num,
+            sweeps: DEFAULT_SWEEPS,
             initial_pos,
             params_buf,
             pos,
             vel,
             keep: vec![u, v, u_prev, v_prev, au, av, wu, wv, div, p, p2, fluid, s],
             bg_main,
-            bg_swap,
             p_integrate: make("integrate"),
             p_clear: make("clear"),
             p_p2g: make("p2g"),
             p_normalize: make("normalize"),
             p_div: make("divergence"),
-            p_jacobi: make("jacobi"),
+            p_sor_red: make("sor_red"),
+            p_sor_black: make("sor_black"),
             p_grad: make("subtract_gradient"),
             p_g2p: make("g2p"),
         }
@@ -292,6 +299,12 @@ impl GpuFlip {
         queue.write_buffer(&self.vel, 0, &zeros);
     }
 
+    /// Red-black SOR sweeps per step (each is 2 passes: red then black). This is
+    /// the dominant pass count, so it's the main perf/quality knob.
+    pub fn set_sweeps(&mut self, n: usize) {
+        self.sweeps = n;
+    }
+
     fn pass1d(&self, enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, n: u32) {
         let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
@@ -323,9 +336,10 @@ impl GpuFlip {
         self.pass1d(enc, &self.p_p2g, self.num);
         self.pass1d(enc, &self.p_normalize, faces);
         self.pass2d(enc, &self.p_div, &self.bg_main);
-        for it in 0..ITERS {
-            let bg = if it % 2 == 0 { &self.bg_main } else { &self.bg_swap };
-            self.pass2d(enc, &self.p_jacobi, bg);
+        // Red-black SOR: each sweep updates one colour then the other, in place.
+        for _ in 0..self.sweeps {
+            self.pass2d(enc, &self.p_sor_red, &self.bg_main);
+            self.pass2d(enc, &self.p_sor_black, &self.bg_main);
         }
         self.pass1d(enc, &self.p_grad, faces);
         self.pass1d(enc, &self.p_g2p, self.num);
@@ -638,5 +652,91 @@ mod tests {
         assert!(avg_y < hgt * 0.45, "water did not settle (avg_y {avg_y})");
         assert!(max_x - min_x > w * 0.3, "water didn't spread ({})", max_x - min_x);
         println!("gpu flip ok: n={num} avg_y={avg_y:.1} width={:.1}", max_x - min_x);
+    }
+
+    /// Sweep the Jacobi iteration count (the dominant pass count) at the app's
+    /// 128x128 grid: throughput vs. solution quality. The settled water should
+    /// stay low (avg_y) and spread wide (width) — if those hold at fewer
+    /// iterations, the extra passes are wasted dispatch overhead. Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gpu_flip_bench() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU adapter; skipping gpu_flip_bench");
+            return;
+        };
+        let (nx, ny, h) = (128u32, 128u32, 1.0);
+        let w = nx as f32 * h;
+
+        // Reference: old 40-iter Jacobi settled to avg_y ~= 6.0 at 599 steps/s.
+        // Quality target is matching that avg_y (more = less volume loss).
+        println!("\n  sweeps   passes/step   steps/s   avg_y(ref~6.0)   width(spread>{:.0})", w * 0.3);
+        for &sweeps in &[20usize, 14, 10, 8, 6, 4] {
+            let mut flip = GpuFlip::new(&device, nx, ny, h);
+            flip.set_sweeps(sweeps);
+            flip.set_frame([0.0, -GRAVITY], SIM_DT, [0.0, 0.0]);
+            flip.upload_params(&queue);
+            let num = flip.num();
+
+            // Settle the water (timed quality is measured at steady state).
+            let mut done = 0;
+            while done < 600 {
+                let mut enc = device.create_command_encoder(&Default::default());
+                for _ in 0..30 {
+                    flip.record_step(&mut enc);
+                }
+                queue.submit([enc.finish()]);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                done += 30;
+            }
+
+            // Time throughput.
+            let steps = 600;
+            let t0 = std::time::Instant::now();
+            let mut d = 0;
+            while d < steps {
+                let mut enc = device.create_command_encoder(&Default::default());
+                for _ in 0..30 {
+                    flip.record_step(&mut enc);
+                }
+                queue.submit([enc.finish()]);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                d += 30;
+            }
+            let sps = steps as f64 / t0.elapsed().as_secs_f64();
+
+            // Read back quality.
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: (num as u64) * 8,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(flip.pos_buffer(), 0, &staging, 0, (num as u64) * 8);
+            queue.submit([enc.finish()]);
+            let slice = staging.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let pos: Vec<[f32; 2]> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+            staging.unmap();
+            let mut avg_y = 0.0f32;
+            let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+            let mut finite = true;
+            for p in &pos {
+                finite &= p[0].is_finite() && p[1].is_finite();
+                avg_y += p[1];
+                min_x = min_x.min(p[0]);
+                max_x = max_x.max(p[0]);
+            }
+            avg_y /= num as f32;
+            let passes = 7 + 2 * sweeps;
+            println!(
+                "  {:>6}   {:>11}   {:>7.0}   {:>10.1}   {:>10.1}{}",
+                sweeps, passes, sps, avg_y, max_x - min_x,
+                if finite { "" } else { "  NONFINITE!" }
+            );
+        }
     }
 }

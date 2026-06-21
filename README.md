@@ -15,8 +15,8 @@ Backends (press the number keys to switch):
    (semi-Lagrangian advection + a ping-pong Jacobi pressure projection),
    rendered straight from the density buffer.
 6. **GPU FLIP** — the FLIP/PIC water solver on the GPU: particle↔grid transfer
-   (P2G via fixed-point integer atomics), the same Jacobi projection on a MAC
-   grid with a free surface, all state resident in buffers.
+   (P2G via fixed-point integer atomics), a red-black SOR pressure projection on
+   a MAC grid with a free surface, all state resident in buffers.
 
 Each backend implements a `Simulation` trait, so the app just drives whichever is
 active; rendering goes through a small shared wgpu toolkit (particle dots, a field
@@ -69,8 +69,8 @@ The wgpu app and its building blocks live in `src/gpu/`:
   (`smoke.wgsl`) with a ping-pong Jacobi pressure projection (the reusable grid
   primitive), drawn by `smoke_render.wgsl`.
 - `flip_gpu.rs` (`GpuFlip` + backend) — the GPU FLIP water solver (`flip.wgsl`):
-  fixed-point-atomic P2G, the same Jacobi projection on a MAC grid with a free
-  surface, drawn by `flip_render.wgsl`.
+  fixed-point-atomic P2G, a red-black SOR pressure projection on a MAC grid with
+  a free surface, drawn by `flip_render.wgsl`.
 - `particles.rs` / `field.rs` — generic particle-dots and field-texture renderers
   for the CPU backends; `render.rs` (+ `render.wgsl`, `metaball_*.wgsl`,
   `marching_squares*.wgsl`) — the GPU-SPH renderer (dots / metaballs / MS).
@@ -84,8 +84,9 @@ The wgpu app and its building blocks live in `src/gpu/`:
 cargo test --release                                   # headless stability guards
 cargo test --release sweep   -- --ignored --nocapture  # SPH stiffness/dt sweep
 cargo test --release bench   -- --ignored --nocapture  # CPU SPH throughput (rayon)
-cargo test --release gpu_bench   -- --ignored --nocapture  # GPU throughput vs N
-cargo test --release gpu_profile -- --ignored --nocapture  # GPU per-pass timing
+cargo test --release gpu_bench   -- --ignored --nocapture  # GPU SPH throughput vs N
+cargo test --release gpu_profile -- --ignored --nocapture  # GPU SPH per-pass timing
+cargo test --release gpu_flip_bench -- --ignored --nocapture  # GPU FLIP sweeps vs quality/throughput
 ```
 
 Every solver has a headless test (it runs with no window and asserts the fluid
@@ -95,13 +96,22 @@ runs the compute shaders and reads positions back, matching the CPU's settling.
 ## Performance notes
 
 - GPU SPH keeps all state resident in GPU buffers and renders from them (no
-  per-frame readback); it scales to ~100k particles in real time (~5 M
-  particle-steps/s at 1.4k → ~238 M at 86k on an Apple GPU).
+  per-frame readback); it scales to ~100k particles in real time.
 - The GPU neighbour search uses a **fixed-capacity bucket grid** (atomic per-cell
   counters). A cell-sorted (CSR) grid was tried for coalesced reads but, at these
   particle counts, the prefix-sum scan plus extra passes cost more than the
-  coalescing saved (~1.3–1.6× slower) — so the bucket grid was kept. `gpu_profile`
-  shows the two neighbour passes dominate (~84% of a step).
+  coalescing saved (~1.3–1.6× slower) — so the bucket grid was kept.
+- The step is **dispatch-overhead bound**, not compute bound, at these sizes:
+  `gpu_bench` barely moved when per-pass compute dropped 13%, but jumped ~20% when
+  the pass count fell. So the SPH step is **4 passes** (clear → build → density →
+  fused forces+integrate): the force/pressure are kept in registers instead of
+  round-tripped through buffers, and pos/vel are double-buffered so the fused pass
+  has no write-after-read race. `GRID_CAP` is 32 (right-sized to real cell
+  occupancy). Net ~+10% (86k) to ~+30% (1.4k) throughput vs. the 5-pass version.
+- GPU FLIP's pressure solve is **red-black Gauss-Seidel SOR**, not Jacobi: it
+  converges so much faster that 10 sweeps reach *lower* divergence (less volume
+  loss) than the old 40 Jacobi iterations, at ~1.8× the step rate. See
+  `gpu_flip_bench` for the sweep-count vs. quality/throughput trade-off.
 
 ## Tuning knobs
 
@@ -114,8 +124,8 @@ runs the compute shaders and reads positions back, matching the CPU's settling.
 
 ## Possible next steps
 
-- Profile GPU FLIP (`gpu_profile`-style timestamps) and tune the Jacobi
-  iteration count / substeps; try particle reordering for P2G locality.
+- Try particle reordering for P2G locality; tune the SOR `OMEGA` / sweep count
+  further (or a multigrid V-cycle) for the FLIP pressure solve.
 - A parallel-scan primitive (for a sorted GPU neighbour grid / FLIP compaction).
 - Surface tension / two fluids; resizable GPU simulation domain.
 - Per-pass timing surfaced live in the egui panel.
