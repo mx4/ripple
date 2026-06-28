@@ -18,6 +18,25 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+/// Build a backend from its number-key digit (1–6), matching the live switcher.
+fn make_backend(digit: u8, gpu: &Gpu) -> Box<dyn Simulation> {
+    match digit {
+        2 => Box::new(SmokeBackend::new(gpu)),
+        3 => Box::new(FlipBackend::new(gpu)),
+        4 => Box::new(SphBackend::new(gpu)),
+        5 => Box::new(GpuSmokeBackend::new(gpu)),
+        6 => Box::new(GpuFlipBackend::new(gpu)),
+        _ => Box::new(SphCpuBackend::new(gpu)),
+    }
+}
+
+/// Autonomous screenshot run (set `RIPPLE_CAPTURE=1`): for each entry, show the
+/// backend for `warmup` seconds of real-time simulation so the fluid develops,
+/// save a clean PNG into `assets/`, then advance. Quits when the plan is done.
+/// `(digit, warmup_seconds)` — the three GPU showcase backends, each caught at a
+/// flattering moment (the same shots used on the README).
+const CAPTURE_PLAN: &[(u8, f32)] = &[(4, 1.6), (6, 3.5), (5, 2.0)];
+
 struct State {
     window: Arc<Window>,
     gpu: Gpu,
@@ -26,6 +45,10 @@ struct State {
     input: Input,
     last: Instant,
     fps: f32,
+    screenshot: bool,
+    capture: bool,
+    shot_idx: usize,
+    phase_start: Instant,
 }
 
 #[derive(Default)]
@@ -44,7 +67,12 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let gpu = Gpu::new(window.clone());
         let overlay = EguiOverlay::new(&gpu, &window);
-        let sim: Box<dyn Simulation> = Box::new(SphCpuBackend::new(&gpu));
+        let capture = std::env::var_os("RIPPLE_CAPTURE").is_some();
+        let sim: Box<dyn Simulation> = if capture {
+            make_backend(CAPTURE_PLAN[0].0, &gpu)
+        } else {
+            Box::new(SphCpuBackend::new(&gpu))
+        };
         self.state = Some(State {
             window,
             gpu,
@@ -53,6 +81,10 @@ impl ApplicationHandler for App {
             input: Input::default(),
             last: Instant::now(),
             fps: 60.0,
+            screenshot: false,
+            capture,
+            shot_idx: 0,
+            phase_start: Instant::now(),
         });
     }
 
@@ -88,6 +120,7 @@ impl ApplicationHandler for App {
                         KeyCode::Digit4 => st.sim = Box::new(SphBackend::new(&st.gpu)),
                         KeyCode::Digit5 => st.sim = Box::new(GpuSmokeBackend::new(&st.gpu)),
                         KeyCode::Digit6 => st.sim = Box::new(GpuFlipBackend::new(&st.gpu)),
+                        KeyCode::KeyP => st.screenshot = true,
                         _ => {}
                     }
                 }
@@ -109,6 +142,15 @@ impl ApplicationHandler for App {
                 st.last = now;
                 st.fps = st.fps * 0.9 + (1.0 / dt.max(1e-4)) * 0.1;
 
+                // In capture mode, once the current backend has simulated for its
+                // warmup window, request a screenshot of this frame.
+                let shoot_now = st.capture
+                    && st.shot_idx < CAPTURE_PLAN.len()
+                    && st.phase_start.elapsed().as_secs_f32() >= CAPTURE_PLAN[st.shot_idx].1;
+                if shoot_now {
+                    st.screenshot = true;
+                }
+
                 st.sim.update(&st.gpu, dt, &st.input);
                 st.input.end_frame();
 
@@ -117,6 +159,23 @@ impl ApplicationHandler for App {
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
                     st.sim.render(&st.gpu, &view);
+
+                    // Save a clean PNG of the rendered fluid (before the egui
+                    // panel is composited on top) when the user presses P.
+                    if st.screenshot {
+                        st.screenshot = false;
+                        let slug: String = st
+                            .sim
+                            .name()
+                            .chars()
+                            .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                            .collect();
+                        let dir = std::path::Path::new("assets");
+                        std::fs::create_dir_all(dir).ok();
+                        let path = dir.join(format!("ripple-{slug}.png"));
+                        st.gpu.save_png(&frame.texture, &path);
+                        eprintln!("saved screenshot to {}", path.display());
+                    }
 
                     let name = st.sim.name().to_string();
                     let fps = st.fps;
@@ -138,6 +197,18 @@ impl ApplicationHandler for App {
                             });
                     });
                     frame.present();
+                }
+                // Advance the capture plan only once the shot was actually saved
+                // (a skipped frame leaves the request pending for next time).
+                if shoot_now && !st.screenshot {
+                    st.shot_idx += 1;
+                    if st.shot_idx >= CAPTURE_PLAN.len() {
+                        event_loop.exit();
+                    } else {
+                        st.sim = make_backend(CAPTURE_PLAN[st.shot_idx].0, &st.gpu);
+                        st.phase_start = Instant::now();
+                        st.last = Instant::now();
+                    }
                 }
                 st.window.request_redraw();
             }

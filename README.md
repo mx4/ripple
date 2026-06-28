@@ -3,6 +3,13 @@
 A real-time 2D fluid playground in Rust — several fluid models in **one window**,
 switchable live, built on **winit + wgpu** with an **egui** tuning panel.
 
+<p align="center">
+  <img src="assets/ripple-gpu-sph.png"   width="32%" alt="GPU SPH liquid (metaballs)" />
+  <img src="assets/ripple-gpu-smoke.png" width="32%" alt="GPU smoke plume" />
+  <img src="assets/ripple-gpu-flip.png"  width="32%" alt="GPU FLIP water" />
+</p>
+<p align="center"><sub>GPU SPH liquid · GPU smoke · GPU FLIP water — all rendered live from the same window.</sub></p>
+
 Backends (press the number keys to switch):
 
 1. **CPU SPH** — Smoothed-Particle Hydrodynamics liquid (particles, rayon-parallel).

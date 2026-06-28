@@ -2002,6 +2002,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "glam",
+ "png",
  "pollster",
  "rayon",
  "wgpu",
